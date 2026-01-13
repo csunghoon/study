@@ -1,0 +1,96 @@
+#====================================================================================
+#세스코 프로젝트 테스트 입니다. 
+#====================================================================================
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+import sys
+from datetime import datetime, timedelta
+
+# ==============================
+# 1. 파라미터 처리
+# ==============================
+# yyyy-mm-dd
+run_date = sys.argv[1]
+
+start_dt = run_date
+end_dt = (datetime.strptime(run_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+# ==============================
+# 2. Spark Session 생성 (Iceberg 설정)
+# ==============================
+spark = SparkSession.builder \
+    .appName("rds-to-iceberg-daily-batch") \
+    .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
+    .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
+    .config("spark.sql.catalog.glue_catalog.warehouse", "s3://my-iceberg-bucket/warehouse") \
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("INFO")
+
+# ==============================
+# 3. RDS JDBC 정보
+# ==============================
+jdbc_url = "jdbc:postgresql://rds-endpoint:5432/mydb"
+jdbc_props = {
+    "user": "db_user",
+    "password": "db_password",
+    "driver": "org.postgresql.Driver"
+}
+
+source_table = "public.source_table"
+
+query = f"""
+(
+    SELECT *
+    FROM {source_table}
+    WHERE updated_at >= '{start_dt}'
+      AND updated_at <  '{end_dt}'
+) src
+"""
+
+# ==============================
+# 4. RDS 데이터 읽기
+# ==============================
+df = spark.read.jdbc(
+    url=jdbc_url,
+    table=query,
+    properties=jdbc_props
+)
+
+df.cache()
+row_cnt = df.count()
+
+print(f"[INFO] Extracted rows: {row_cnt}")
+
+if row_cnt == 0:
+    print("[INFO] No data to process. Job finished.")
+    spark.stop()
+    sys.exit(0)
+
+df.createOrReplaceTempView("staging_data")
+
+# ==============================
+# 5. Iceberg MERGE 수행
+# ==============================
+target_table = "glue_catalog.analytics.iceberg_table"
+
+merge_sql = f"""
+MERGE INTO {target_table} t
+USING staging_data s
+ON t.id = s.id
+WHEN MATCHED THEN
+  UPDATE SET *
+WHEN NOT MATCHED THEN
+  INSERT *
+"""
+
+spark.sql(merge_sql)
+
+print("[INFO] MERGE completed successfully")
+
+# ==============================
+# 6. 종료
+# ==============================
+spark.stop()
